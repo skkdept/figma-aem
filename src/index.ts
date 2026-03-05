@@ -1,136 +1,141 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { exec } from "child_process";
+import * as fse from "fs-extra";
+import * as path from "path";
 
 // ---------------------------------------------------------------------------
-// Helper: Figma API fetcher
+// Naming helpers
 // ---------------------------------------------------------------------------
 
-interface FigmaNode {
-  id: string;
-  name: string;
-  type: string;
-  children?: FigmaNode[];
-  style?: Record<string, unknown>;
-  fills?: Array<{ type: string; color?: { r: number; g: number; b: number; a: number } }>;
-  layoutMode?: string;
-  primaryAxisAlignItems?: string;
-  counterAxisAlignItems?: string;
-  paddingLeft?: number;
-  paddingRight?: number;
-  paddingTop?: number;
-  paddingBottom?: number;
-  itemSpacing?: number;
-  absoluteBoundingBox?: { x: number; y: number; width: number; height: number };
-  characters?: string;
-}
-
-export function parseFigmaUrl(figmaUrl: string): { fileKey: string; nodeId: string } {
-  const url = new URL(figmaUrl);
-  const pathParts = url.pathname.split("/");
-  const fileIndex = pathParts.indexOf("file") !== -1
-    ? pathParts.indexOf("file")
-    : pathParts.indexOf("design");
-  if (fileIndex === -1 || fileIndex + 1 >= pathParts.length) {
-    throw new Error("Invalid Figma URL: could not extract file key.");
-  }
-  const fileKey = pathParts[fileIndex + 1];
-  const nodeId = url.searchParams.get("node-id") ?? "";
-  return { fileKey, nodeId };
-}
-
-export function simplifyNode(node: FigmaNode): Record<string, unknown> {
-  const result: Record<string, unknown> = {
-    id: node.id,
-    name: node.name,
-    type: node.type,
-  };
-
-  // Auto-layout properties
-  if (node.layoutMode) {
-    result.autoLayout = {
-      direction: node.layoutMode,
-      primaryAxisAlign: node.primaryAxisAlignItems,
-      counterAxisAlign: node.counterAxisAlignItems,
-      padding: {
-        top: node.paddingTop ?? 0,
-        right: node.paddingRight ?? 0,
-        bottom: node.paddingBottom ?? 0,
-        left: node.paddingLeft ?? 0,
-      },
-      itemSpacing: node.itemSpacing ?? 0,
-    };
-  }
-
-  // Typography
-  if (node.style) {
-    result.typography = node.style;
-  }
-
-  // Color tokens
-  if (node.fills && node.fills.length > 0) {
-    result.colorTokens = node.fills
-      .filter((f) => f.type === "SOLID" && f.color)
-      .map((f) => {
-        const c = f.color!;
-        return {
-          r: Math.round(c.r * 255),
-          g: Math.round(c.g * 255),
-          b: Math.round(c.b * 255),
-          a: c.a,
-        };
-      });
-  }
-
-  // Characters (text content)
-  if (node.characters) {
-    result.characters = node.characters;
-  }
-
-  // Bounding box
-  if (node.absoluteBoundingBox) {
-    result.boundingBox = node.absoluteBoundingBox;
-  }
-
-  // Recurse children
-  if (node.children) {
-    result.children = node.children.map(simplifyNode);
-  }
-
-  return result;
-}
-
-// ---------------------------------------------------------------------------
-// Helper: AEM boilerplate generators
-// ---------------------------------------------------------------------------
-
-interface FigmaDataNode {
-  name: string;
-  type: string;
-  characters?: string;
-  children?: FigmaDataNode[];
-}
-
+/** Convert an arbitrary string to camelCase (for Java field names). */
 export function toCamelCase(str: string): string {
   return str
     .replace(/[^a-zA-Z0-9]+(.)/g, (_, chr: string) => chr.toUpperCase())
     .replace(/^[A-Z]/, (chr) => chr.toLowerCase());
 }
 
-export function toBemClass(componentName: string, element?: string, modifier?: string): string {
-  let cls = componentName.toLowerCase().replace(/[^a-z0-9]+/g, "-");
-  if (element) {
-    cls += `__${element.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
-  }
-  if (modifier) {
-    cls += `--${modifier.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
-  }
-  return cls;
+/** Convert a string to PascalCase (for Java class names). */
+export function toPascalCase(str: string): string {
+  const camel = toCamelCase(str);
+  return camel.charAt(0).toUpperCase() + camel.slice(1);
 }
 
-function collectFields(
-  node: FigmaDataNode,
-  fields: Array<{ name: string; type: "text" | "image" }>,
+/** Convert a string to kebab-case (for JCR node names). */
+export function toKebabCase(str: string): string {
+  return str
+    .replace(/([a-z0-9])([A-Z])/g, "$1-$2")
+    .replace(/[^a-zA-Z0-9]+/g, "-")
+    .toLowerCase()
+    .replace(/^-+|-+$/g, "");
+}
+
+// ---------------------------------------------------------------------------
+// Shell helper
+// ---------------------------------------------------------------------------
+
+export function execAsync(
+  command: string,
+  options?: { cwd?: string },
+): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    exec(command, { cwd: options?.cwd, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        reject(new Error(`Command failed: ${err.message}\nstderr: ${stderr}`));
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Figma types & helpers
+// ---------------------------------------------------------------------------
+
+export interface FigmaNode {
+  id: string;
+  name: string;
+  type: string;
+  children?: FigmaNode[];
+  layoutMode?: string;
+  characters?: string;
+}
+
+export interface FrameInfo {
+  id: string;
+  name: string;
+  type: string;
+  classification: "Component" | "Container";
+}
+
+/**
+ * Classify a top-level frame as Component or Container.
+ * A Container is a frame that has children which are themselves frames (or instances).
+ * A Component is everything else (leaf-level design element).
+ */
+export function classifyFrame(node: FigmaNode): "Component" | "Container" {
+  if (!node.children || node.children.length === 0) {
+    return "Component";
+  }
+  const hasNestedFrames = node.children.some(
+    (child) =>
+      child.type === "FRAME" ||
+      child.type === "COMPONENT" ||
+      child.type === "INSTANCE",
+  );
+  return hasNestedFrames ? "Container" : "Component";
+}
+
+/**
+ * Recursively traverse the Figma tree and collect all top-level frames
+ * (direct children of CANVAS pages).
+ */
+export function collectTopLevelFrames(node: FigmaNode): FrameInfo[] {
+  const frames: FrameInfo[] = [];
+
+  if (node.type === "CANVAS" && node.children) {
+    for (const child of node.children) {
+      if (
+        child.type === "FRAME" ||
+        child.type === "COMPONENT" ||
+        child.type === "COMPONENT_SET"
+      ) {
+        frames.push({
+          id: child.id,
+          name: child.name,
+          type: child.type,
+          classification: classifyFrame(child),
+        });
+      }
+    }
+  }
+
+  // Recurse into pages if we're at document level
+  if (node.children) {
+    for (const child of node.children) {
+      if (child.type === "CANVAS") {
+        frames.push(...collectTopLevelFrames(child));
+      }
+    }
+  }
+
+  return frames;
+}
+
+// ---------------------------------------------------------------------------
+// Figma-data field extraction
+// ---------------------------------------------------------------------------
+
+export interface FieldInfo {
+  name: string;
+  type: "text" | "image";
+}
+
+export function collectFields(
+  node: FigmaNode,
+  fields: FieldInfo[],
 ): void {
   if (node.type === "TEXT" && node.characters) {
     const fieldName = toCamelCase(node.name);
@@ -138,7 +143,11 @@ function collectFields(
       fields.push({ name: fieldName, type: "text" });
     }
   }
-  if (node.type === "RECTANGLE" || node.type === "IMAGE" || node.type === "VECTOR") {
+  if (
+    node.type === "RECTANGLE" ||
+    node.type === "IMAGE" ||
+    node.type === "VECTOR"
+  ) {
     const fieldName = toCamelCase(node.name);
     if (!fields.some((f) => f.name === fieldName)) {
       fields.push({ name: fieldName, type: "image" });
@@ -150,6 +159,10 @@ function collectFields(
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Code generators for write_component_ui
+// ---------------------------------------------------------------------------
 
 export function generateContentXml(componentName: string): string {
   const jcrTitle = componentName.replace(/([A-Z])/g, " $1").trim();
@@ -167,9 +180,9 @@ export function generateContentXml(componentName: string): string {
 
 export function generateDialogXml(
   componentName: string,
-  figmaData: FigmaDataNode,
+  figmaData: FigmaNode,
 ): string {
-  const fields: Array<{ name: string; type: "text" | "image" }> = [];
+  const fields: FieldInfo[] = [];
   collectFields(figmaData, fields);
 
   const fieldItems = fields
@@ -225,21 +238,60 @@ ${fieldItems}
 `;
 }
 
-export function generateSlingModel(
+export function generateHtl(
   componentName: string,
-  figmaData: FigmaDataNode,
-  targetPath: string,
+  figmaData: FigmaNode,
 ): string {
-  const fields: Array<{ name: string; type: "text" | "image" }> = [];
+  const fields: FieldInfo[] = [];
   collectFields(figmaData, fields);
 
-  // Derive a Java package from the target path
-  const packagePath = targetPath
-    .replace(/^\/+/, "")
-    .replace(/\/+$/, "")
-    .replace(/\//g, ".");
+  const blockName = toKebabCase(componentName);
+  const className = toPascalCase(componentName);
 
-  const className = componentName.charAt(0).toUpperCase() + componentName.slice(1);
+  const innerHtml = fields
+    .map((f) => {
+      const elementClass = `${blockName}__${toKebabCase(f.name)}`;
+      if (f.type === "text") {
+        return `    <div class="${elementClass}">\${model.${f.name}}</div>`;
+      }
+      return `    <img class="${elementClass}" src="\${model.${f.name}}" alt="${f.name}"/>`;
+    })
+    .join("\n");
+
+  // Map Figma auto-layout to flexbox CSS
+  let styleBlock = "";
+  if (figmaData.layoutMode) {
+    const direction = figmaData.layoutMode === "HORIZONTAL" ? "row" : "column";
+    styleBlock = `\n<style>
+.${blockName} {
+    display: flex;
+    flex-direction: ${direction};
+}
+</style>\n`;
+  }
+
+  return `<sly data-sly-use.model="${className}">
+<div class="${blockName}">
+${innerHtml}
+</div>
+</sly>${styleBlock}
+`;
+}
+
+// ---------------------------------------------------------------------------
+// Code generator for write_component_logic
+// ---------------------------------------------------------------------------
+
+export function generateSlingModel(
+  componentName: string,
+  figmaData: FigmaNode,
+  packageName: string,
+): string {
+  const fields: FieldInfo[] = [];
+  collectFields(figmaData, fields);
+
+  const className = toPascalCase(componentName);
+  const kebabName = toKebabCase(componentName);
 
   const fieldDeclarations = fields
     .map((f) => {
@@ -257,18 +309,22 @@ export function generateSlingModel(
     })
     .join("\n\n");
 
-  return `package ${packagePath};
+  return `package ${packageName};
 
+import org.apache.sling.api.SlingHttpServletRequest;
 import org.apache.sling.api.resource.Resource;
 import org.apache.sling.models.annotations.DefaultInjectionStrategy;
+import org.apache.sling.models.annotations.Exporter;
 import org.apache.sling.models.annotations.Model;
 import org.apache.sling.models.annotations.injectorspecific.ValueMapValue;
 import org.apache.sling.models.annotations.InjectionStrategy;
 
 @Model(
-    adaptables = Resource.class,
-    defaultInjectionStrategy = DefaultInjectionStrategy.OPTIONAL
+    adaptables = {Resource.class, SlingHttpServletRequest.class},
+    defaultInjectionStrategy = DefaultInjectionStrategy.OPTIONAL,
+    resourceType = "${kebabName}"
 )
+@Exporter(name = "jackson", extensions = "json")
 public class ${className} {
 
 ${fieldDeclarations}
@@ -278,229 +334,46 @@ ${getters}
 `;
 }
 
-export function generateHtl(
-  componentName: string,
-  figmaData: FigmaDataNode,
-): string {
-  const fields: Array<{ name: string; type: "text" | "image" }> = [];
-  collectFields(figmaData, fields);
-
-  const blockName = toBemClass(componentName);
-  const className = componentName.charAt(0).toUpperCase() + componentName.slice(1);
-
-  const innerHtml = fields
-    .map((f) => {
-      const elementClass = toBemClass(componentName, f.name);
-      if (f.type === "text") {
-        return `    <div class="${elementClass}">\${model.${f.name}}</div>`;
-      }
-      return `    <img class="${elementClass}" src="\${model.${f.name}}" alt="${f.name}"/>`;
-    })
-    .join("\n");
-
-  return `<sly data-sly-use.model="${className}">
-<div class="${blockName}">
-${innerHtml}
-</div>
-</sly>
-`;
-}
-
-// ---------------------------------------------------------------------------
-// Helper: push_to_aem
-// ---------------------------------------------------------------------------
-
-export interface PushToAemResult {
-  status: number;
-  body: string;
-}
-
-export async function pushToAem(
-  host: string,
-  jcrPath: string,
-  contentXml: string,
-  user: string,
-  password: string,
-): Promise<PushToAemResult> {
-  const url = `${host}${jcrPath}`;
-  const authHeader = "Basic " + Buffer.from(`${user}:${password}`).toString("base64");
-  const body = new URLSearchParams();
-  body.append("jcr:primaryType", "nt:unstructured");
-  body.append(":content", contentXml);
-  body.append(":contentType", "application/xml");
-  body.append(":operation", "import");
-
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: authHeader,
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: body.toString(),
-  });
-
-  const responseBody = await resp.text();
-  return { status: resp.status, body: responseBody };
-}
-
 // ---------------------------------------------------------------------------
 // MCP Server
 // ---------------------------------------------------------------------------
 
 export function createServer(): McpServer {
   const server = new McpServer({
-    name: "figma-aem-mcp-server",
+    name: "aem-master-architect",
     version: "1.0.0",
   });
 
-  // ------ Tool A: analyze_figma_node ------
+  // ------ Tool 1: init_project ------
   server.tool(
-    "analyze_figma_node",
-    "Fetch a Figma node and return a simplified JSON with Auto Layout, typography, and color tokens.",
+    "init_project",
+    "Create a full Maven multi-module AEM project structure using the aem-project-archetype.",
     {
-      figma_url: z.string().url().describe("Full Figma URL including a node-id query parameter"),
-      personal_access_token: z.string().min(1).describe("Figma Personal Access Token"),
+      appId: z.string().min(1).describe("Application ID (e.g. 'mysite')"),
+      groupId: z.string().min(1).describe("Maven Group ID (e.g. 'com.mysite')"),
+      appTitle: z.string().min(1).describe("Human-readable application title (e.g. 'My Site')"),
     },
-    async ({ figma_url, personal_access_token }) => {
-      const { fileKey, nodeId } = parseFigmaUrl(figma_url);
-      const apiUrl = nodeId
-        ? `https://api.figma.com/v1/files/${fileKey}/nodes?ids=${encodeURIComponent(nodeId)}`
-        : `https://api.figma.com/v1/files/${fileKey}`;
+    async ({ appId, groupId, appTitle }) => {
+      const cmd = [
+        "mvn", "archetype:generate", "-B",
+        "-DarchetypeGroupId=com.adobe.aem",
+        "-DarchetypeArtifactId=aem-project-archetype",
+        "-DarchetypeVersion=49",
+        `-DappTitle="${appTitle}"`,
+        `-DappId=${appId}`,
+        `-DgroupId=${groupId}`,
+        `-DartifactId=${appId}`,
+        `-Dpackage=${groupId}`,
+      ].join(" ");
 
-      const response = await fetch(apiUrl, {
-        headers: { "X-FIGMA-TOKEN": personal_access_token },
-      });
-
-      if (!response.ok) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Figma API error: ${response.status} ${response.statusText}`,
-            },
-          ],
-        };
-      }
-
-      const json = (await response.json()) as {
-        nodes?: Record<string, { document: FigmaNode }>;
-        document?: FigmaNode;
-      };
-
-      let rootNode: FigmaNode;
-      if (json.nodes && nodeId) {
-        const normalizedId = nodeId.replace(/-/g, ":");
-        const entry = json.nodes[normalizedId];
-        if (!entry) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `Node "${nodeId}" not found in Figma response.`,
-              },
-            ],
-          };
-        }
-        rootNode = entry.document;
-      } else if (json.document) {
-        rootNode = json.document;
-      } else {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: "Unexpected Figma API response structure.",
-            },
-          ],
-        };
-      }
-
-      const simplified = simplifyNode(rootNode);
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(simplified, null, 2),
-          },
-        ],
-      };
-    },
-  );
-
-  // ------ Tool B: generate_aem_boilerplate ------
-  server.tool(
-    "generate_aem_boilerplate",
-    "Generate AEM component boilerplate (content XML, dialog, Sling Model, HTL) from Figma node data.",
-    {
-      component_name: z.string().min(1).describe("PascalCase component name, e.g. HeroBanner"),
-      figma_data: z
-        .string()
-        .min(1)
-        .describe("Simplified Figma node JSON (output from analyze_figma_node)"),
-      target_path: z
-        .string()
-        .min(1)
-        .describe("Java package / AEM apps path, e.g. com/mysite/components/content"),
-    },
-    async ({ component_name, figma_data, target_path }) => {
-      let parsedFigma: FigmaDataNode;
       try {
-        parsedFigma = JSON.parse(figma_data) as FigmaDataNode;
-      } catch {
-        return {
-          content: [
-            { type: "text" as const, text: "Invalid figma_data: must be valid JSON." },
-          ],
-        };
-      }
-
-      const contentXml = generateContentXml(component_name);
-      const dialogXml = generateDialogXml(component_name, parsedFigma);
-      const slingModel = generateSlingModel(component_name, parsedFigma, target_path);
-      const htl = generateHtl(component_name, parsedFigma);
-
-      const output = {
-        ".content.xml": contentXml,
-        "_cq_dialog/.content.xml": dialogXml,
-        [`${component_name}.java`]: slingModel,
-        [`${component_name}.html`]: htl,
-      };
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(output, null, 2),
-          },
-        ],
-      };
-    },
-  );
-
-  // ------ Tool C: push_to_aem ------
-  server.tool(
-    "push_to_aem",
-    "Push content XML to a running AEM instance via the Sling POST Servlet.",
-    {
-      jcr_path: z.string().min(1).describe("JCR path, e.g. /apps/mysite/components/heroBanner"),
-      content_xml: z.string().min(1).describe("Content XML to import"),
-      aem_host: z
-        .string()
-        .url()
-        .default("http://localhost:4502")
-        .describe("AEM host URL (default: http://localhost:4502)"),
-      aem_user: z.string().default("admin").describe("AEM username (default: admin)"),
-      aem_password: z.string().default("admin").describe("AEM password (default: admin)"),
-    },
-    async ({ jcr_path, content_xml, aem_host, aem_user, aem_password }) => {
-      try {
-        const result = await pushToAem(aem_host, jcr_path, content_xml, aem_user, aem_password);
+        const { stdout, stderr } = await execAsync(cmd);
         return {
           content: [
             {
               type: "text" as const,
               text: JSON.stringify(
-                { status: result.status, body: result.body },
+                { success: true, appId, projectPath: path.resolve(appId), stdout, stderr },
                 null,
                 2,
               ),
@@ -511,7 +384,292 @@ export function createServer(): McpServer {
         const message = err instanceof Error ? err.message : String(err);
         return {
           content: [
-            { type: "text" as const, text: `AEM push failed: ${message}` },
+            { type: "text" as const, text: JSON.stringify({ success: false, error: message }, null, 2) },
+          ],
+        };
+      }
+    },
+  );
+
+  // ------ Tool 2: crawl_figma ------
+  server.tool(
+    "crawl_figma",
+    "Recursively traverse the Figma JSON tree and return all top-level frames, classifying each as Component or Container.",
+    {
+      figmaUrl: z.string().url().describe("Full Figma file URL"),
+      figmaToken: z.string().min(1).describe("Figma Personal Access Token"),
+    },
+    async ({ figmaUrl, figmaToken }) => {
+      try {
+        const url = new URL(figmaUrl);
+        const pathParts = url.pathname.split("/");
+        const fileIndex =
+          pathParts.indexOf("file") !== -1
+            ? pathParts.indexOf("file")
+            : pathParts.indexOf("design");
+        if (fileIndex === -1 || fileIndex + 1 >= pathParts.length) {
+          throw new Error("Invalid Figma URL: could not extract file key.");
+        }
+        const fileKey = pathParts[fileIndex + 1];
+
+        const apiUrl = `https://api.figma.com/v1/files/${fileKey}`;
+        const response = await fetch(apiUrl, {
+          headers: { "X-FIGMA-TOKEN": figmaToken },
+        });
+
+        if (!response.ok) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify({
+                  success: false,
+                  error: `Figma API error: ${response.status} ${response.statusText}`,
+                }, null, 2),
+              },
+            ],
+          };
+        }
+
+        const json = (await response.json()) as { document: FigmaNode };
+        const frames = collectTopLevelFrames(json.document);
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({ success: true, frames }, null, 2),
+            },
+          ],
+        };
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify({ success: false, error: message }, null, 2) },
+          ],
+        };
+      }
+    },
+  );
+
+  // ------ Tool 3: write_component_ui ------
+  server.tool(
+    "write_component_ui",
+    "Create AEM component UI files: HTL template, .content.xml, and Granite UI Dialog XML in the ui.apps module.",
+    {
+      componentName: z.string().min(1).describe("PascalCase component name (e.g. 'HeroBanner')"),
+      figmaJson: z.string().min(1).describe("Figma node JSON describing the component structure"),
+      projectPath: z.string().min(1).describe("Absolute path to the AEM project root"),
+    },
+    async ({ componentName, figmaJson, projectPath }) => {
+      try {
+        const figmaData = JSON.parse(figmaJson) as FigmaNode;
+        const kebabName = toKebabCase(componentName);
+
+        // Discover the ui.apps component directory
+        const uiAppsBase = path.join(
+          projectPath,
+          "ui.apps",
+          "src",
+          "main",
+          "content",
+          "jcr_root",
+          "apps",
+        );
+        // Find the app folder (first directory in apps)
+        let appFolder: string;
+        if (await fse.pathExists(uiAppsBase)) {
+          const entries = await fse.readdir(uiAppsBase);
+          const dirs = [];
+          for (const entry of entries) {
+            const stat = await fse.stat(path.join(uiAppsBase, entry));
+            if (stat.isDirectory()) {
+              dirs.push(entry);
+            }
+          }
+          appFolder = dirs.length > 0 ? dirs[0] : path.basename(projectPath);
+        } else {
+          appFolder = path.basename(projectPath);
+        }
+
+        const componentDir = path.join(
+          uiAppsBase,
+          appFolder,
+          "components",
+          kebabName,
+        );
+
+        await fse.ensureDir(componentDir);
+        await fse.ensureDir(path.join(componentDir, "_cq_dialog"));
+
+        // Generate files
+        const contentXml = generateContentXml(componentName);
+        const dialogXml = generateDialogXml(componentName, figmaData);
+        const htl = generateHtl(componentName, figmaData);
+
+        await fse.writeFile(
+          path.join(componentDir, ".content.xml"),
+          contentXml,
+          "utf-8",
+        );
+        await fse.writeFile(
+          path.join(componentDir, "_cq_dialog", ".content.xml"),
+          dialogXml,
+          "utf-8",
+        );
+        await fse.writeFile(
+          path.join(componentDir, `${kebabName}.html`),
+          htl,
+          "utf-8",
+        );
+
+        const filesWritten = [
+          path.join(componentDir, ".content.xml"),
+          path.join(componentDir, "_cq_dialog", ".content.xml"),
+          path.join(componentDir, `${kebabName}.html`),
+        ];
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({ success: true, componentDir, filesWritten }, null, 2),
+            },
+          ],
+        };
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify({ success: false, error: message }, null, 2) },
+          ],
+        };
+      }
+    },
+  );
+
+  // ------ Tool 4: write_component_logic ------
+  server.tool(
+    "write_component_logic",
+    "Generate a Java Sling Model for an AEM component in the core module, with @Model, @ValueMapValue, and @Exporter annotations.",
+    {
+      componentName: z.string().min(1).describe("PascalCase component name (e.g. 'HeroBanner')"),
+      figmaJson: z.string().min(1).describe("Figma node JSON describing the component structure"),
+      projectPath: z.string().min(1).describe("Absolute path to the AEM project root"),
+    },
+    async ({ componentName, figmaJson, projectPath }) => {
+      try {
+        const figmaData = JSON.parse(figmaJson) as FigmaNode;
+        const className = toPascalCase(componentName);
+
+        // Discover the Java source root in the core module
+        const coreJavaBase = path.join(projectPath, "core", "src", "main", "java");
+
+        // Resolve the package from the existing directory structure
+        let packageName = "com.example.core.models";
+        if (await fse.pathExists(coreJavaBase)) {
+          // Walk to find a 'models' or 'core' package
+          const findPackage = async (dir: string, depth: number): Promise<string | null> => {
+            if (depth > 6) return null;
+            const entries = await fse.readdir(dir);
+            for (const entry of entries) {
+              const full = path.join(dir, entry);
+              const stat = await fse.stat(full);
+              if (stat.isDirectory()) {
+                if (entry === "models") {
+                  return full;
+                }
+                const result = await findPackage(full, depth + 1);
+                if (result) return result;
+              }
+            }
+            return null;
+          };
+
+          const modelsDir = await findPackage(coreJavaBase, 0);
+          if (modelsDir) {
+            packageName = path.relative(coreJavaBase, modelsDir).replace(/\//g, ".").replace(/\\/g, ".");
+          } else {
+            // Use the first package found and append .models
+            const firstLevel = await fse.readdir(coreJavaBase);
+            if (firstLevel.length > 0) {
+              const walkDown = async (dir: string, depth: number): Promise<string> => {
+                if (depth > 4) return dir;
+                const entries = await fse.readdir(dir);
+                const dirs = [];
+                for (const entry of entries) {
+                  const full = path.join(dir, entry);
+                  const stat = await fse.stat(full);
+                  if (stat.isDirectory()) dirs.push(full);
+                }
+                if (dirs.length === 1) return walkDown(dirs[0], depth + 1);
+                return dir;
+              };
+              const deepest = await walkDown(coreJavaBase, 0);
+              const relPath = path.relative(coreJavaBase, deepest);
+              if (relPath) {
+                packageName = relPath.replace(/\//g, ".").replace(/\\/g, ".") + ".models";
+              }
+            }
+          }
+        }
+
+        // Create the directory structure and write the Java file
+        const packageDir = path.join(coreJavaBase, packageName.replace(/\./g, "/"));
+        await fse.ensureDir(packageDir);
+
+        const javaCode = generateSlingModel(componentName, figmaData, packageName);
+        const javaFilePath = path.join(packageDir, `${className}.java`);
+        await fse.writeFile(javaFilePath, javaCode, "utf-8");
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                { success: true, javaFilePath, packageName, className },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify({ success: false, error: message }, null, 2) },
+          ],
+        };
+      }
+    },
+  );
+
+  // ------ Tool 5: deploy_project ------
+  server.tool(
+    "deploy_project",
+    "Build and deploy the AEM project to a running AEM instance using Maven.",
+    {
+      projectPath: z.string().min(1).describe("Absolute path to the AEM project root"),
+    },
+    async ({ projectPath }) => {
+      const cmd = "mvn clean install -PautoInstallPackage";
+      try {
+        const { stdout, stderr } = await execAsync(cmd, { cwd: projectPath });
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({ success: true, stdout, stderr }, null, 2),
+            },
+          ],
+        };
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify({ success: false, error: message }, null, 2) },
           ],
         };
       }

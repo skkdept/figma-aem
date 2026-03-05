@@ -1,7 +1,7 @@
 {
   "name": "figma-aem-mcp-server",
   "version": "1.0.0",
-  "description": "MCP Server for Figma-to-AEM component automation",
+  "description": "AEM Master Architect MCP Server – init, crawl, write, and deploy AEM projects from Figma designs",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
@@ -17,9 +17,11 @@
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
+    "fs-extra": "^11.3.4",
     "zod": "^3.24.4"
   },
   "devDependencies": {
+    "@types/fs-extra": "^11.0.4",
     "@types/jest": "^29.5.14",
     "@types/node": "^22.15.3",
     "jest": "^29.7.0",

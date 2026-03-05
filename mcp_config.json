@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "figma-aem": {
+    "aem-master-architect": {
       "command": "node",
       "args": ["dist/index.js"],
       "env": {}
