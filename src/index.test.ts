@@ -9,7 +9,8 @@ import {
   generateDialogXml,
   generateHtl,
   generateSlingModel,
-  execAsync,
+  execFileAsync,
+  validateMavenArg,
   createServer,
   FigmaNode,
   FieldInfo,
@@ -286,10 +287,9 @@ describe("generateHtl", () => {
     expect(htl).toContain('data-sly-use.model="Card"');
   });
 
-  it("renders text in a div and images in an img tag", () => {
+  it("uses human-readable alt text for images", () => {
     const htl = generateHtl("Card", figmaData);
-    expect(htl).toContain("<div");
-    expect(htl).toContain("<img");
+    expect(htl).toContain('alt="icon"');
   });
 
   it("includes flexbox style block when layoutMode is set", () => {
@@ -305,6 +305,10 @@ describe("generateHtl", () => {
     const htl = generateHtl("Row", figmaWithLayout);
     expect(htl).toContain("display: flex");
     expect(htl).toContain("flex-direction: row");
+    // Style should be inside the sly/div, not after it
+    const slyCloseIndex = htl.indexOf("</sly>");
+    const styleIndex = htl.indexOf("<style>");
+    expect(styleIndex).toBeLessThan(slyCloseIndex);
   });
 
   it("generates column direction for VERTICAL layout", () => {
@@ -364,16 +368,33 @@ describe("generateSlingModel", () => {
 });
 
 // ---------------------------------------------------------------------------
-// execAsync
+// validateMavenArg
 // ---------------------------------------------------------------------------
-describe("execAsync", () => {
+describe("validateMavenArg", () => {
+  it("passes for safe values", () => {
+    expect(() => validateMavenArg("mysite", "appId")).not.toThrow();
+    expect(() => validateMavenArg("com.mysite", "groupId")).not.toThrow();
+    expect(() => validateMavenArg("My Site", "appTitle")).not.toThrow();
+  });
+
+  it("rejects shell metacharacters", () => {
+    expect(() => validateMavenArg("my`whoami`", "appId")).toThrow("disallowed characters");
+    expect(() => validateMavenArg("my$HOME", "appId")).toThrow("disallowed characters");
+    expect(() => validateMavenArg("my;rm -rf /", "appId")).toThrow("disallowed characters");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// execFileAsync
+// ---------------------------------------------------------------------------
+describe("execFileAsync", () => {
   it("resolves with stdout on success", async () => {
-    const result = await execAsync("echo hello");
+    const result = await execFileAsync("echo", ["hello"]);
     expect(result.stdout.trim()).toBe("hello");
   });
 
   it("rejects on a bad command", async () => {
-    await expect(execAsync("false")).rejects.toThrow("Command failed");
+    await expect(execFileAsync("false", [])).rejects.toThrow("Command failed");
   });
 });
 

@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { exec } from "child_process";
+import { execFile } from "child_process";
 import * as fse from "fs-extra";
 import * as path from "path";
 
@@ -35,12 +35,25 @@ export function toKebabCase(str: string): string {
 // Shell helper
 // ---------------------------------------------------------------------------
 
-export function execAsync(
-  command: string,
+/**
+ * Validate that a string is safe to use as a Maven argument value.
+ * Rejects shell metacharacters to prevent command injection.
+ */
+export function validateMavenArg(value: string, label: string): void {
+  if (/[`$;|&<>(){}!\\]/.test(value)) {
+    throw new Error(
+      `Invalid ${label}: contains disallowed characters. Only alphanumeric, spaces, dots, hyphens, and underscores are permitted.`,
+    );
+  }
+}
+
+export function execFileAsync(
+  file: string,
+  args: string[],
   options?: { cwd?: string },
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    exec(command, { cwd: options?.cwd, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+    execFile(file, args, { cwd: options?.cwd, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) {
         reject(new Error(`Command failed: ${err.message}\nstderr: ${stderr}`));
         return;
@@ -248,33 +261,37 @@ export function generateHtl(
   const blockName = toKebabCase(componentName);
   const className = toPascalCase(componentName);
 
+  /** Convert camelCase field name to a human-readable label. */
+  const toLabel = (name: string): string =>
+    name.replace(/([A-Z])/g, " $1").trim().toLowerCase();
+
   const innerHtml = fields
     .map((f) => {
       const elementClass = `${blockName}__${toKebabCase(f.name)}`;
       if (f.type === "text") {
         return `    <div class="${elementClass}">\${model.${f.name}}</div>`;
       }
-      return `    <img class="${elementClass}" src="\${model.${f.name}}" alt="${f.name}"/>`;
+      return `    <img class="${elementClass}" src="\${model.${f.name}}" alt="${toLabel(f.name)}"/>`;
     })
     .join("\n");
 
-  // Map Figma auto-layout to flexbox CSS
+  // Map Figma auto-layout to flexbox CSS (inline, inside the component markup)
   let styleBlock = "";
   if (figmaData.layoutMode) {
     const direction = figmaData.layoutMode === "HORIZONTAL" ? "row" : "column";
-    styleBlock = `\n<style>
-.${blockName} {
-    display: flex;
-    flex-direction: ${direction};
-}
-</style>\n`;
+    styleBlock = `\n    <style>
+    .${blockName} {
+        display: flex;
+        flex-direction: ${direction};
+    }
+    </style>`;
   }
 
   return `<sly data-sly-use.model="${className}">
 <div class="${blockName}">
-${innerHtml}
+${innerHtml}${styleBlock}
 </div>
-</sly>${styleBlock}
+</sly>
 `;
 }
 
@@ -354,20 +371,25 @@ export function createServer(): McpServer {
       appTitle: z.string().min(1).describe("Human-readable application title (e.g. 'My Site')"),
     },
     async ({ appId, groupId, appTitle }) => {
-      const cmd = [
-        "mvn", "archetype:generate", "-B",
-        "-DarchetypeGroupId=com.adobe.aem",
-        "-DarchetypeArtifactId=aem-project-archetype",
-        "-DarchetypeVersion=49",
-        `-DappTitle="${appTitle}"`,
-        `-DappId=${appId}`,
-        `-DgroupId=${groupId}`,
-        `-DartifactId=${appId}`,
-        `-Dpackage=${groupId}`,
-      ].join(" ");
-
       try {
-        const { stdout, stderr } = await execAsync(cmd);
+        // Validate inputs to prevent injection
+        validateMavenArg(appId, "appId");
+        validateMavenArg(groupId, "groupId");
+        validateMavenArg(appTitle, "appTitle");
+
+        const args = [
+          "archetype:generate", "-B",
+          "-DarchetypeGroupId=com.adobe.aem",
+          "-DarchetypeArtifactId=aem-project-archetype",
+          "-DarchetypeVersion=49",
+          `-DappTitle=${appTitle}`,
+          `-DappId=${appId}`,
+          `-DgroupId=${groupId}`,
+          `-DartifactId=${appId}`,
+          `-Dpackage=${groupId}`,
+        ];
+
+        const { stdout, stderr } = await execFileAsync("mvn", args);
         return {
           content: [
             {
@@ -477,18 +499,26 @@ export function createServer(): McpServer {
           "jcr_root",
           "apps",
         );
-        // Find the app folder (first directory in apps)
+        // Find the app folder — prefer a directory that already contains 'components'
         let appFolder: string;
         if (await fse.pathExists(uiAppsBase)) {
           const entries = await fse.readdir(uiAppsBase);
-          const dirs = [];
+          const dirs: string[] = [];
           for (const entry of entries) {
             const stat = await fse.stat(path.join(uiAppsBase, entry));
             if (stat.isDirectory()) {
               dirs.push(entry);
             }
           }
-          appFolder = dirs.length > 0 ? dirs[0] : path.basename(projectPath);
+          // Prefer the directory that already has a 'components' subfolder
+          let found: string | undefined;
+          for (const dir of dirs) {
+            if (await fse.pathExists(path.join(uiAppsBase, dir, "components"))) {
+              found = dir;
+              break;
+            }
+          }
+          appFolder = found ?? (dirs.length > 0 ? dirs[0] : path.basename(projectPath));
         } else {
           appFolder = path.basename(projectPath);
         }
@@ -569,9 +599,15 @@ export function createServer(): McpServer {
         // Resolve the package from the existing directory structure
         let packageName = "com.example.core.models";
         if (await fse.pathExists(coreJavaBase)) {
-          // Walk to find a 'models' or 'core' package
+          const visited = new Set<string>();
+
+          // Walk to find a 'models' directory
           const findPackage = async (dir: string, depth: number): Promise<string | null> => {
             if (depth > 6) return null;
+            const realDir = await fse.realpath(dir);
+            if (visited.has(realDir)) return null;
+            visited.add(realDir);
+
             const entries = await fse.readdir(dir);
             for (const entry of entries) {
               const full = path.join(dir, entry);
@@ -596,6 +632,10 @@ export function createServer(): McpServer {
             if (firstLevel.length > 0) {
               const walkDown = async (dir: string, depth: number): Promise<string> => {
                 if (depth > 4) return dir;
+                const realDir = await fse.realpath(dir);
+                if (visited.has(realDir)) return dir;
+                visited.add(realDir);
+
                 const entries = await fse.readdir(dir);
                 const dirs = [];
                 for (const entry of entries) {
@@ -654,9 +694,12 @@ export function createServer(): McpServer {
       projectPath: z.string().min(1).describe("Absolute path to the AEM project root"),
     },
     async ({ projectPath }) => {
-      const cmd = "mvn clean install -PautoInstallPackage";
       try {
-        const { stdout, stderr } = await execAsync(cmd, { cwd: projectPath });
+        const { stdout, stderr } = await execFileAsync(
+          "mvn",
+          ["clean", "install", "-PautoInstallPackage"],
+          { cwd: projectPath },
+        );
         return {
           content: [
             {
