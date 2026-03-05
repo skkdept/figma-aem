@@ -1,111 +1,26 @@
 import {
-  parseFigmaUrl,
-  simplifyNode,
   toCamelCase,
-  toBemClass,
+  toPascalCase,
+  toKebabCase,
+  classifyFrame,
+  collectTopLevelFrames,
+  collectFields,
   generateContentXml,
   generateDialogXml,
-  generateSlingModel,
   generateHtl,
-  pushToAem,
+  generateSlingModel,
+  execFileAsync,
+  validateMavenArg,
   createServer,
+  FigmaNode,
+  FieldInfo,
 } from "./index";
+import * as fse from "fs-extra";
+import * as path from "path";
+import * as os from "os";
 
 // ---------------------------------------------------------------------------
-// parseFigmaUrl
-// ---------------------------------------------------------------------------
-describe("parseFigmaUrl", () => {
-  it("extracts file key and node-id from a standard Figma URL", () => {
-    const url =
-      "https://www.figma.com/file/ABC123/MyFile?node-id=1-2";
-    const result = parseFigmaUrl(url);
-    expect(result.fileKey).toBe("ABC123");
-    expect(result.nodeId).toBe("1-2");
-  });
-
-  it("handles /design/ URLs", () => {
-    const url =
-      "https://www.figma.com/design/XYZ789/DesignFile?node-id=10-20";
-    const result = parseFigmaUrl(url);
-    expect(result.fileKey).toBe("XYZ789");
-    expect(result.nodeId).toBe("10-20");
-  });
-
-  it("returns empty nodeId when not present", () => {
-    const url = "https://www.figma.com/file/ABC123/MyFile";
-    const result = parseFigmaUrl(url);
-    expect(result.fileKey).toBe("ABC123");
-    expect(result.nodeId).toBe("");
-  });
-
-  it("throws for an invalid URL", () => {
-    expect(() => parseFigmaUrl("https://example.com/nope")).toThrow(
-      "Invalid Figma URL",
-    );
-  });
-});
-
-// ---------------------------------------------------------------------------
-// simplifyNode
-// ---------------------------------------------------------------------------
-describe("simplifyNode", () => {
-  it("returns basic fields for a minimal node", () => {
-    const node = { id: "1", name: "Frame", type: "FRAME" };
-    const result = simplifyNode(node);
-    expect(result).toEqual({ id: "1", name: "Frame", type: "FRAME" });
-  });
-
-  it("extracts autoLayout properties", () => {
-    const node = {
-      id: "2",
-      name: "AutoLayout",
-      type: "FRAME",
-      layoutMode: "HORIZONTAL",
-      primaryAxisAlignItems: "CENTER",
-      counterAxisAlignItems: "MIN",
-      paddingTop: 10,
-      paddingRight: 20,
-      paddingBottom: 10,
-      paddingLeft: 20,
-      itemSpacing: 8,
-    };
-    const result = simplifyNode(node);
-    expect(result.autoLayout).toEqual({
-      direction: "HORIZONTAL",
-      primaryAxisAlign: "CENTER",
-      counterAxisAlign: "MIN",
-      padding: { top: 10, right: 20, bottom: 10, left: 20 },
-      itemSpacing: 8,
-    });
-  });
-
-  it("extracts color tokens from SOLID fills", () => {
-    const node = {
-      id: "3",
-      name: "Rect",
-      type: "RECTANGLE",
-      fills: [{ type: "SOLID", color: { r: 1, g: 0, b: 0, a: 1 } }],
-    };
-    const result = simplifyNode(node);
-    expect(result.colorTokens).toEqual([{ r: 255, g: 0, b: 0, a: 1 }]);
-  });
-
-  it("recurses children", () => {
-    const node = {
-      id: "p",
-      name: "Parent",
-      type: "FRAME",
-      children: [{ id: "c1", name: "Child", type: "TEXT", characters: "Hello" }],
-    };
-    const result = simplifyNode(node);
-    expect(result.children).toHaveLength(1);
-    const child = (result.children as Record<string, unknown>[])[0];
-    expect(child.characters).toBe("Hello");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// toCamelCase / toBemClass
+// Naming helpers
 // ---------------------------------------------------------------------------
 describe("toCamelCase", () => {
   it("converts spaced name", () => {
@@ -115,21 +30,191 @@ describe("toCamelCase", () => {
   it("handles single word", () => {
     expect(toCamelCase("title")).toBe("title");
   });
+
+  it("handles PascalCase input", () => {
+    expect(toCamelCase("HeroBanner")).toBe("heroBanner");
+  });
 });
 
-describe("toBemClass", () => {
-  it("returns block class", () => {
-    expect(toBemClass("HeroBanner")).toBe("herobanner");
+describe("toPascalCase", () => {
+  it("converts spaced name", () => {
+    expect(toPascalCase("hero banner")).toBe("HeroBanner");
   });
 
-  it("returns block__element", () => {
-    expect(toBemClass("HeroBanner", "title")).toBe("herobanner__title");
+  it("handles already PascalCase", () => {
+    expect(toPascalCase("HeroBanner")).toBe("HeroBanner");
   });
 
-  it("returns block__element--modifier", () => {
-    expect(toBemClass("HeroBanner", "title", "large")).toBe(
-      "herobanner__title--large",
-    );
+  it("handles single word", () => {
+    expect(toPascalCase("card")).toBe("Card");
+  });
+});
+
+describe("toKebabCase", () => {
+  it("converts PascalCase", () => {
+    expect(toKebabCase("HeroBanner")).toBe("hero-banner");
+  });
+
+  it("converts camelCase", () => {
+    expect(toKebabCase("heroBanner")).toBe("hero-banner");
+  });
+
+  it("handles spaces", () => {
+    expect(toKebabCase("Hero Banner")).toBe("hero-banner");
+  });
+
+  it("handles single word", () => {
+    expect(toKebabCase("card")).toBe("card");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// classifyFrame
+// ---------------------------------------------------------------------------
+describe("classifyFrame", () => {
+  it("classifies a frame with no children as Component", () => {
+    const node: FigmaNode = { id: "1", name: "Icon", type: "FRAME" };
+    expect(classifyFrame(node)).toBe("Component");
+  });
+
+  it("classifies a frame with only TEXT children as Component", () => {
+    const node: FigmaNode = {
+      id: "2",
+      name: "Badge",
+      type: "FRAME",
+      children: [
+        { id: "2a", name: "Label", type: "TEXT", characters: "Hello" },
+      ],
+    };
+    expect(classifyFrame(node)).toBe("Component");
+  });
+
+  it("classifies a frame with nested FRAMEs as Container", () => {
+    const node: FigmaNode = {
+      id: "3",
+      name: "Page Layout",
+      type: "FRAME",
+      children: [
+        { id: "3a", name: "Header", type: "FRAME" },
+        { id: "3b", name: "Footer", type: "FRAME" },
+      ],
+    };
+    expect(classifyFrame(node)).toBe("Container");
+  });
+
+  it("classifies a frame with INSTANCE children as Container", () => {
+    const node: FigmaNode = {
+      id: "4",
+      name: "Card Grid",
+      type: "FRAME",
+      children: [
+        { id: "4a", name: "Card 1", type: "INSTANCE" },
+        { id: "4b", name: "Card 2", type: "INSTANCE" },
+      ],
+    };
+    expect(classifyFrame(node)).toBe("Container");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// collectTopLevelFrames
+// ---------------------------------------------------------------------------
+describe("collectTopLevelFrames", () => {
+  it("collects frames from CANVAS pages", () => {
+    const doc: FigmaNode = {
+      id: "0:0",
+      name: "Document",
+      type: "DOCUMENT",
+      children: [
+        {
+          id: "1:1",
+          name: "Page 1",
+          type: "CANVAS",
+          children: [
+            { id: "2:1", name: "HeroBanner", type: "FRAME" },
+            {
+              id: "2:2",
+              name: "CardGrid",
+              type: "FRAME",
+              children: [
+                { id: "3:1", name: "Card", type: "COMPONENT" },
+              ],
+            },
+            { id: "2:3", name: "Icon", type: "COMPONENT" },
+          ],
+        },
+      ],
+    };
+
+    const frames = collectTopLevelFrames(doc);
+    expect(frames).toHaveLength(3);
+    expect(frames[0].name).toBe("HeroBanner");
+    expect(frames[0].classification).toBe("Component");
+    expect(frames[1].name).toBe("CardGrid");
+    expect(frames[1].classification).toBe("Container");
+    expect(frames[2].name).toBe("Icon");
+    expect(frames[2].classification).toBe("Component");
+  });
+
+  it("ignores non-frame children of canvas", () => {
+    const doc: FigmaNode = {
+      id: "0:0",
+      name: "Document",
+      type: "DOCUMENT",
+      children: [
+        {
+          id: "1:1",
+          name: "Page",
+          type: "CANVAS",
+          children: [
+            { id: "2:1", name: "Label", type: "TEXT", characters: "hi" },
+          ],
+        },
+      ],
+    };
+
+    const frames = collectTopLevelFrames(doc);
+    expect(frames).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// collectFields
+// ---------------------------------------------------------------------------
+describe("collectFields", () => {
+  it("collects text and image fields", () => {
+    const node: FigmaNode = {
+      id: "1",
+      name: "Card",
+      type: "FRAME",
+      children: [
+        { id: "2", name: "Title", type: "TEXT", characters: "Hello" },
+        { id: "3", name: "Background", type: "IMAGE" },
+        { id: "4", name: "Icon", type: "VECTOR" },
+      ],
+    };
+    const fields: FieldInfo[] = [];
+    collectFields(node, fields);
+    expect(fields).toEqual([
+      { name: "title", type: "text" },
+      { name: "background", type: "image" },
+      { name: "icon", type: "image" },
+    ]);
+  });
+
+  it("de-duplicates fields by name", () => {
+    const node: FigmaNode = {
+      id: "1",
+      name: "Card",
+      type: "FRAME",
+      children: [
+        { id: "2", name: "Title", type: "TEXT", characters: "A" },
+        { id: "3", name: "Title", type: "TEXT", characters: "B" },
+      ],
+    };
+    const fields: FieldInfo[] = [];
+    collectFields(node, fields);
+    expect(fields).toHaveLength(1);
   });
 });
 
@@ -149,54 +234,30 @@ describe("generateContentXml", () => {
 // generateDialogXml
 // ---------------------------------------------------------------------------
 describe("generateDialogXml", () => {
-  const figmaData = {
+  const figmaData: FigmaNode = {
+    id: "1",
     name: "HeroBanner",
     type: "FRAME",
     children: [
-      { name: "Heading", type: "TEXT", characters: "Hello World" },
-      { name: "Background Image", type: "IMAGE" },
+      { id: "2", name: "Heading", type: "TEXT", characters: "Hello World" },
+      { id: "3", name: "Background Image", type: "IMAGE" },
     ],
   };
 
   it("creates a textfield for TEXT nodes", () => {
     const xml = generateDialogXml("HeroBanner", figmaData);
-    expect(xml).toContain("granite/ui/components/coral/foundation/form/textfield");
+    expect(xml).toContain(
+      "granite/ui/components/coral/foundation/form/textfield",
+    );
     expect(xml).toContain('name="./heading"');
   });
 
   it("creates a pathfield for IMAGE nodes", () => {
     const xml = generateDialogXml("HeroBanner", figmaData);
-    expect(xml).toContain("granite/ui/components/coral/foundation/form/pathfield");
+    expect(xml).toContain(
+      "granite/ui/components/coral/foundation/form/pathfield",
+    );
     expect(xml).toContain('name="./backgroundImage"');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// generateSlingModel
-// ---------------------------------------------------------------------------
-describe("generateSlingModel", () => {
-  const figmaData = {
-    name: "Card",
-    type: "FRAME",
-    children: [
-      { name: "Title", type: "TEXT", characters: "Card Title" },
-      { name: "Icon", type: "VECTOR" },
-    ],
-  };
-
-  it("generates a Java class with @ValueMapValue fields", () => {
-    const java = generateSlingModel("Card", figmaData, "com/mysite/components");
-    expect(java).toContain("package com.mysite.components;");
-    expect(java).toContain("public class Card");
-    expect(java).toContain("@ValueMapValue");
-    expect(java).toContain("private String title;");
-    expect(java).toContain("private String icon;");
-  });
-
-  it("generates getter methods", () => {
-    const java = generateSlingModel("Card", figmaData, "com/mysite/components");
-    expect(java).toContain("public String getTitle()");
-    expect(java).toContain("public String getIcon()");
   });
 });
 
@@ -204,16 +265,17 @@ describe("generateSlingModel", () => {
 // generateHtl
 // ---------------------------------------------------------------------------
 describe("generateHtl", () => {
-  const figmaData = {
+  const figmaData: FigmaNode = {
+    id: "1",
     name: "Card",
     type: "FRAME",
     children: [
-      { name: "Title", type: "TEXT", characters: "Card Title" },
-      { name: "Icon", type: "VECTOR" },
+      { id: "2", name: "Title", type: "TEXT", characters: "Card Title" },
+      { id: "3", name: "Icon", type: "VECTOR" },
     ],
   };
 
-  it("uses BEM classes", () => {
+  it("uses kebab-case classes", () => {
     const htl = generateHtl("Card", figmaData);
     expect(htl).toContain('class="card"');
     expect(htl).toContain('class="card__title"');
@@ -225,58 +287,265 @@ describe("generateHtl", () => {
     expect(htl).toContain('data-sly-use.model="Card"');
   });
 
-  it("renders text in a div and images in an img tag", () => {
+  it("uses human-readable alt text for images", () => {
     const htl = generateHtl("Card", figmaData);
-    expect(htl).toContain("<div");
-    expect(htl).toContain("<img");
+    expect(htl).toContain('alt="icon"');
+  });
+
+  it("includes flexbox style block when layoutMode is set", () => {
+    const figmaWithLayout: FigmaNode = {
+      id: "1",
+      name: "Row",
+      type: "FRAME",
+      layoutMode: "HORIZONTAL",
+      children: [
+        { id: "2", name: "Label", type: "TEXT", characters: "hi" },
+      ],
+    };
+    const htl = generateHtl("Row", figmaWithLayout);
+    expect(htl).toContain("display: flex");
+    expect(htl).toContain("flex-direction: row");
+    // Style should be inside the sly/div, not after it
+    const slyCloseIndex = htl.indexOf("</sly>");
+    const styleIndex = htl.indexOf("<style>");
+    expect(styleIndex).toBeLessThan(slyCloseIndex);
+  });
+
+  it("generates column direction for VERTICAL layout", () => {
+    const figmaVertical: FigmaNode = {
+      id: "1",
+      name: "Stack",
+      type: "FRAME",
+      layoutMode: "VERTICAL",
+      children: [
+        { id: "2", name: "Label", type: "TEXT", characters: "hi" },
+      ],
+    };
+    const htl = generateHtl("Stack", figmaVertical);
+    expect(htl).toContain("flex-direction: column");
   });
 });
 
 // ---------------------------------------------------------------------------
-// pushToAem (mocked fetch)
+// generateSlingModel
 // ---------------------------------------------------------------------------
-describe("pushToAem", () => {
-  const originalFetch = global.fetch;
+describe("generateSlingModel", () => {
+  const figmaData: FigmaNode = {
+    id: "1",
+    name: "Card",
+    type: "FRAME",
+    children: [
+      { id: "2", name: "Title", type: "TEXT", characters: "Card Title" },
+      { id: "3", name: "Icon", type: "VECTOR" },
+    ],
+  };
 
-  afterEach(() => {
-    global.fetch = originalFetch;
+  it("generates a Java class with @Model, @ValueMapValue, and @Exporter", () => {
+    const java = generateSlingModel("Card", figmaData, "com.mysite.core.models");
+    expect(java).toContain("package com.mysite.core.models;");
+    expect(java).toContain("public class Card");
+    expect(java).toContain("@Model(");
+    expect(java).toContain("@ValueMapValue");
+    expect(java).toContain("@Exporter(name = \"jackson\", extensions = \"json\")");
+    expect(java).toContain("private String title;");
+    expect(java).toContain("private String icon;");
   });
 
-  it("sends correct request and returns status/body", async () => {
-    global.fetch = jest.fn().mockResolvedValue({
-      status: 200,
-      text: () => Promise.resolve("OK"),
-    }) as unknown as typeof fetch;
+  it("generates getter methods", () => {
+    const java = generateSlingModel("Card", figmaData, "com.mysite.core.models");
+    expect(java).toContain("public String getTitle()");
+    expect(java).toContain("public String getIcon()");
+  });
 
-    const result = await pushToAem(
-      "http://localhost:4502",
-      "/apps/mysite/components/hero",
-      "<jcr:root/>",
-      "admin",
-      "admin",
+  it("includes resourceType as kebab-case", () => {
+    const java = generateSlingModel(
+      "HeroBanner",
+      figmaData,
+      "com.mysite.core.models",
+    );
+    expect(java).toContain('resourceType = "hero-banner"');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// validateMavenArg
+// ---------------------------------------------------------------------------
+describe("validateMavenArg", () => {
+  it("passes for safe values", () => {
+    expect(() => validateMavenArg("mysite", "appId")).not.toThrow();
+    expect(() => validateMavenArg("com.mysite", "groupId")).not.toThrow();
+    expect(() => validateMavenArg("My Site", "appTitle")).not.toThrow();
+  });
+
+  it("rejects shell metacharacters", () => {
+    expect(() => validateMavenArg("my`whoami`", "appId")).toThrow("disallowed characters");
+    expect(() => validateMavenArg("my$HOME", "appId")).toThrow("disallowed characters");
+    expect(() => validateMavenArg("my;rm -rf /", "appId")).toThrow("disallowed characters");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// execFileAsync
+// ---------------------------------------------------------------------------
+describe("execFileAsync", () => {
+  it("resolves with stdout on success", async () => {
+    const result = await execFileAsync("echo", ["hello"]);
+    expect(result.stdout.trim()).toBe("hello");
+  });
+
+  it("rejects on a bad command", async () => {
+    await expect(execFileAsync("false", [])).rejects.toThrow("Command failed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// write_component_ui integration (file system)
+// ---------------------------------------------------------------------------
+describe("write_component_ui integration", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), "aem-test-"));
+    // Create a minimal ui.apps structure
+    const uiAppsDir = path.join(
+      tmpDir,
+      "ui.apps",
+      "src",
+      "main",
+      "content",
+      "jcr_root",
+      "apps",
+      "mysite",
+      "components",
+    );
+    await fse.ensureDir(uiAppsDir);
+  });
+
+  afterEach(async () => {
+    await fse.remove(tmpDir);
+  });
+
+  it("writes component files to the correct location", async () => {
+    const figmaData: FigmaNode = {
+      id: "1",
+      name: "HeroBanner",
+      type: "FRAME",
+      children: [
+        { id: "2", name: "Title", type: "TEXT", characters: "Hello" },
+      ],
+    };
+
+    const kebabName = toKebabCase("HeroBanner");
+    const componentDir = path.join(
+      tmpDir,
+      "ui.apps",
+      "src",
+      "main",
+      "content",
+      "jcr_root",
+      "apps",
+      "mysite",
+      "components",
+      kebabName,
     );
 
-    expect(result.status).toBe(200);
-    expect(result.body).toBe("OK");
+    await fse.ensureDir(componentDir);
+    await fse.ensureDir(path.join(componentDir, "_cq_dialog"));
 
-    const call = (global.fetch as jest.Mock).mock.calls[0];
-    expect(call[0]).toBe("http://localhost:4502/apps/mysite/components/hero");
-    expect(call[1].method).toBe("POST");
-    expect(call[1].headers.Authorization).toMatch(/^Basic /);
+    const contentXml = generateContentXml("HeroBanner");
+    const dialogXml = generateDialogXml("HeroBanner", figmaData);
+    const htl = generateHtl("HeroBanner", figmaData);
+
+    await fse.writeFile(path.join(componentDir, ".content.xml"), contentXml);
+    await fse.writeFile(
+      path.join(componentDir, "_cq_dialog", ".content.xml"),
+      dialogXml,
+    );
+    await fse.writeFile(
+      path.join(componentDir, `${kebabName}.html`),
+      htl,
+    );
+
+    expect(await fse.pathExists(path.join(componentDir, ".content.xml"))).toBe(
+      true,
+    );
+    expect(
+      await fse.pathExists(
+        path.join(componentDir, "_cq_dialog", ".content.xml"),
+      ),
+    ).toBe(true);
+    expect(
+      await fse.pathExists(path.join(componentDir, `${kebabName}.html`)),
+    ).toBe(true);
+
+    const writtenXml = await fse.readFile(
+      path.join(componentDir, ".content.xml"),
+      "utf-8",
+    );
+    expect(writtenXml).toContain('jcr:title="Hero Banner"');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// write_component_logic integration (file system)
+// ---------------------------------------------------------------------------
+describe("write_component_logic integration", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), "aem-test-"));
+    // Create a minimal core module structure
+    const modelsDir = path.join(
+      tmpDir,
+      "core",
+      "src",
+      "main",
+      "java",
+      "com",
+      "mysite",
+      "core",
+      "models",
+    );
+    await fse.ensureDir(modelsDir);
   });
 
-  it("returns error info on fetch failure", async () => {
-    global.fetch = jest.fn().mockRejectedValue(new Error("ECONNREFUSED")) as unknown as typeof fetch;
+  afterEach(async () => {
+    await fse.remove(tmpDir);
+  });
 
-    await expect(
-      pushToAem(
-        "http://localhost:4502",
-        "/apps/test",
-        "<xml/>",
-        "admin",
-        "admin",
-      ),
-    ).rejects.toThrow("ECONNREFUSED");
+  it("writes a Sling Model Java file", async () => {
+    const figmaData: FigmaNode = {
+      id: "1",
+      name: "Card",
+      type: "FRAME",
+      children: [
+        { id: "2", name: "Title", type: "TEXT", characters: "Hi" },
+      ],
+    };
+
+    const packageName = "com.mysite.core.models";
+    const className = toPascalCase("Card");
+    const packageDir = path.join(
+      tmpDir,
+      "core",
+      "src",
+      "main",
+      "java",
+      "com",
+      "mysite",
+      "core",
+      "models",
+    );
+
+    const javaCode = generateSlingModel("Card", figmaData, packageName);
+    const javaFile = path.join(packageDir, `${className}.java`);
+    await fse.writeFile(javaFile, javaCode, "utf-8");
+
+    expect(await fse.pathExists(javaFile)).toBe(true);
+    const content = await fse.readFile(javaFile, "utf-8");
+    expect(content).toContain("package com.mysite.core.models;");
+    expect(content).toContain("@Exporter");
+    expect(content).toContain("public class Card");
   });
 });
 
